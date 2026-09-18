@@ -1,0 +1,25 @@
+# PV lab knowledge library
+# Fill [ai] before using parse/extract. Fill [neo4j] later for graph sync.
+
+[storage]
+backend = "local"
+local_root = "data/minio"
+catalog = "data/catalog.sqlite"
+minio_endpoint = ""
+minio_access_key = ""
+minio_secret_key = ""
+minio_bucket = "papers"
+minio_secure = false
+
+[ai]
+base_url = "https://api.openai.com/v1"
+api_key = ""
+model = "gpt-4o-mini"
+timeout_seconds = 90
+
+[neo4j]
+enabled = false
+uri = "bolt://127.0.0.1:7687"
+user = "neo4j"
+password = ""
+database = "neo4j"
