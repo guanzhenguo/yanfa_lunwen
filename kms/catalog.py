@@ -7,6 +7,16 @@ from pathlib import Path
 from typing import Any
 
 _YEAR_RE = re.compile(r'\b((?:19|20)\d{2})\b')
+_FTS_TERM = re.compile(r'[\w\u4e00-\u9fff+\-]+')
+
+
+def fts_match_query(query: str) -> str:
+    terms = []
+    for raw in _FTS_TERM.findall(query or ''):
+        if len(raw) < 2:
+            continue
+        terms.append('"' + raw.replace('"', '') + '"')
+    return ' OR '.join(terms[:12])
 
 
 def year_from_published(published: str) -> int | None:
@@ -47,6 +57,34 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_documents_doi
 CREATE INDEX IF NOT EXISTS idx_documents_sha256
     ON documents(sha256) WHERE sha256 != '';
 
+CREATE TABLE IF NOT EXISTS paper_parses (
+    document_id INTEGER PRIMARY KEY,
+    sha256 TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL,
+    parser TEXT NOT NULL DEFAULT 'pymupdf',
+    page_count INTEGER NOT NULL DEFAULT 0,
+    char_count INTEGER NOT NULL DEFAULT 0,
+    chunk_count INTEGER NOT NULL DEFAULT 0,
+    preview TEXT NOT NULL DEFAULT '',
+    error TEXT NOT NULL DEFAULT '',
+    parsed_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS paper_chunks (
+    id INTEGER PRIMARY KEY,
+    document_id INTEGER NOT NULL,
+    chunk_index INTEGER NOT NULL,
+    section TEXT NOT NULL DEFAULT '',
+    page_from INTEGER NOT NULL DEFAULT 0,
+    page_to INTEGER NOT NULL DEFAULT 0,
+    text TEXT NOT NULL,
+    char_count INTEGER NOT NULL DEFAULT 0,
+    UNIQUE(document_id, chunk_index)
+);
+
+CREATE INDEX IF NOT EXISTS idx_paper_chunks_doc
+    ON paper_chunks(document_id, chunk_index);
+
 CREATE TABLE IF NOT EXISTS ingest_jobs (
     id INTEGER PRIMARY KEY,
     query TEXT NOT NULL,
@@ -79,6 +117,7 @@ class Catalog:
 
         self.conn.executescript(KEYWORD_SCHEMA)
         self._migrate()
+        self._ensure_chunk_fts()
         self.conn.commit()
 
     def _migrate(self) -> None:
@@ -103,6 +142,90 @@ class Catalog:
                     'UPDATE documents SET year = ? WHERE id = ?',
                     (year, row['id']),
                 )
+
+    def _ensure_chunk_fts(self) -> None:
+        try:
+            self.conn.execute(
+                """
+                CREATE VIRTUAL TABLE IF NOT EXISTS paper_chunks_fts USING fts5(
+                    text,
+                    document_id UNINDEXED,
+                    chunk_index UNINDEXED,
+                    tokenize = 'unicode61'
+                )
+                """
+            )
+        except sqlite3.OperationalError:
+            return
+        chunk_count = self.conn.execute('SELECT COUNT(*) FROM paper_chunks').fetchone()[0]
+        fts_count = self.conn.execute('SELECT COUNT(*) FROM paper_chunks_fts').fetchone()[0]
+        if int(chunk_count) != int(fts_count):
+            self.rebuild_chunk_fts()
+
+    def rebuild_chunk_fts(self, document_id: int | None = None) -> None:
+        try:
+            self.conn.execute('SELECT 1 FROM paper_chunks_fts LIMIT 0')
+        except sqlite3.OperationalError:
+            return
+        if document_id is None:
+            self.conn.execute('DELETE FROM paper_chunks_fts')
+            self.conn.execute(
+                """
+                INSERT INTO paper_chunks_fts(rowid, text, document_id, chunk_index)
+                SELECT id, text, document_id, chunk_index FROM paper_chunks
+                """
+            )
+            return
+        self.conn.execute(
+            """
+            DELETE FROM paper_chunks_fts
+            WHERE rowid IN (SELECT id FROM paper_chunks WHERE document_id = ?)
+            """,
+            (int(document_id),),
+        )
+        self.conn.execute(
+            """
+            INSERT INTO paper_chunks_fts(rowid, text, document_id, chunk_index)
+            SELECT id, text, document_id, chunk_index
+            FROM paper_chunks
+            WHERE document_id = ?
+            """,
+            (int(document_id),),
+        )
+
+    def search_chunks_bm25(self, query: str, limit: int = 20) -> list[dict[str, Any]]:
+        match = fts_match_query(query)
+        if not match:
+            return []
+        try:
+            rows = self.conn.execute(
+                """
+                SELECT
+                    c.id,
+                    c.document_id,
+                    c.chunk_index,
+                    c.section,
+                    c.page_from,
+                    c.page_to,
+                    c.text,
+                    bm25(paper_chunks_fts) AS rank
+                FROM paper_chunks_fts
+                JOIN paper_chunks c ON c.id = paper_chunks_fts.rowid
+                WHERE paper_chunks_fts MATCH ?
+                ORDER BY rank
+                LIMIT ?
+                """,
+                (match, int(limit)),
+            ).fetchall()
+        except sqlite3.OperationalError:
+            return []
+        out = []
+        for row in rows:
+            item = dict(row)
+            rank = float(item.pop('rank') or 0.0)
+            item['score'] = max(0.0, 8.0 - rank)
+            out.append(item)
+        return out
 
     def close(self) -> None:
         self.conn.close()
@@ -331,6 +454,180 @@ class Catalog:
         params.extend([int(limit), int(offset)])
         rows = self.conn.execute(sql, params).fetchall()
         return [dict(row) for row in rows]
+
+    def get_parse(self, document_id: int) -> dict[str, Any] | None:
+        row = self.conn.execute(
+            'SELECT * FROM paper_parses WHERE document_id = ?',
+            (int(document_id),),
+        ).fetchone()
+        return dict(row) if row else None
+
+    def list_chunks(self, document_id: int) -> list[dict[str, Any]]:
+        rows = self.conn.execute(
+            """
+            SELECT chunk_index, section, page_from, page_to, text, char_count
+            FROM paper_chunks
+            WHERE document_id = ?
+            ORDER BY chunk_index
+            """,
+            (int(document_id),),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def save_parse(self, document_id: int, sha256: str, result: dict[str, Any]) -> None:
+        doc_id = int(document_id)
+        now = _now()
+        old_ids = [
+            int(row[0])
+            for row in self.conn.execute(
+                'SELECT id FROM paper_chunks WHERE document_id = ?',
+                (doc_id,),
+            ).fetchall()
+        ]
+        if old_ids:
+            placeholders = ','.join('?' * len(old_ids))
+            try:
+                self.conn.execute(
+                    f'DELETE FROM paper_chunks_fts WHERE rowid IN ({placeholders})',
+                    old_ids,
+                )
+            except sqlite3.OperationalError:
+                pass
+        self.conn.execute('DELETE FROM paper_chunks WHERE document_id = ?', (doc_id,))
+        self.conn.execute(
+            """
+            INSERT INTO paper_parses (
+                document_id, sha256, status, parser, page_count, char_count,
+                chunk_count, preview, error, parsed_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(document_id) DO UPDATE SET
+                sha256=excluded.sha256,
+                status=excluded.status,
+                parser=excluded.parser,
+                page_count=excluded.page_count,
+                char_count=excluded.char_count,
+                chunk_count=excluded.chunk_count,
+                preview=excluded.preview,
+                error=excluded.error,
+                parsed_at=excluded.parsed_at
+            """,
+            (
+                doc_id,
+                sha256 or '',
+                result.get('status') or 'error',
+                result.get('parser') or 'pymupdf',
+                int(result.get('page_count') or 0),
+                int(result.get('char_count') or 0),
+                int(result.get('chunk_count') or len(result.get('chunks') or [])),
+                (result.get('preview') or '')[:4000],
+                result.get('error') or '',
+                now,
+            ),
+        )
+        for chunk in result.get('chunks') or []:
+            text = str(chunk.get('text') or '')
+            self.conn.execute(
+                """
+                INSERT INTO paper_chunks (
+                    document_id, chunk_index, section, page_from, page_to, text, char_count
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    doc_id,
+                    int(chunk.get('chunk_index') or 0),
+                    str(chunk.get('section') or 'Body'),
+                    int(chunk.get('page_from') or 0),
+                    int(chunk.get('page_to') or 0),
+                    text,
+                    int(chunk.get('char_count') or len(text)),
+                ),
+            )
+        self.rebuild_chunk_fts(doc_id)
+        self.conn.commit()
+
+    def parse_payload(self, document_id: int, *, include_text: bool = True) -> dict[str, Any] | None:
+        row = self.get_parse(document_id)
+        if not row:
+            return None
+        chunks = self.list_chunks(document_id)
+        summaries = []
+        for chunk in chunks:
+            text = chunk.get('text') or ''
+            preview = re.sub(r'\s+', ' ', text).strip()
+            if len(preview) > 420:
+                preview = preview[:420].rstrip() + '…'
+            item = {
+                'chunk_index': chunk['chunk_index'],
+                'section': chunk.get('section') or '',
+                'page_from': chunk.get('page_from') or 0,
+                'page_to': chunk.get('page_to') or 0,
+                'char_count': chunk.get('char_count') or 0,
+                'preview': preview,
+            }
+            if include_text:
+                item['text'] = text
+            summaries.append(item)
+        return {
+            'document_id': int(document_id),
+            'status': row.get('status') or '',
+            'parser': row.get('parser') or '',
+            'sha256': row.get('sha256') or '',
+            'page_count': int(row.get('page_count') or 0),
+            'char_count': int(row.get('char_count') or 0),
+            'chunk_count': int(row.get('chunk_count') or 0),
+            'preview': row.get('preview') or '',
+            'error': row.get('error') or '',
+            'parsed_at': row.get('parsed_at') or '',
+            'chunks': summaries,
+        }
+
+    def search_chunk_hits(self, query_tokens: list[str], limit: int = 20) -> list[dict[str, Any]]:
+        tokens = [item for item in query_tokens if len(item) >= 2][:8]
+        if not tokens:
+            return []
+        hits: list[dict[str, Any]] = []
+        seen: set[int] = set()
+        for token in tokens:
+            like = f'%{token}%'
+            rows = self.conn.execute(
+                """
+                SELECT document_id AS id, text
+                FROM paper_chunks
+                WHERE text LIKE ?
+                LIMIT 20
+                """,
+                (like,),
+            ).fetchall()
+            for row in rows:
+                doc_id = int(row['id'])
+                if doc_id in seen:
+                    continue
+                seen.add(doc_id)
+                hits.append({'id': doc_id, 'excerpt': (row['text'] or '')[:280]})
+                if len(hits) >= limit:
+                    return hits
+        return hits
+
+    def matching_chunk_excerpt(self, document_id: int, query_tokens: set[str]) -> str:
+        rows = self.list_chunks(document_id)
+        best = ''
+        best_score = 0
+        for row in rows:
+            text = row.get('text') or ''
+            lowered = text.lower()
+            score = 0
+            for token in query_tokens:
+                if token and token.lower() in lowered:
+                    score += 1
+            if score > best_score:
+                best_score = score
+                best = text
+        if not best:
+            return ''
+        snippet = re.sub(r'\s+', ' ', best).strip()
+        if len(snippet) > 280:
+            snippet = snippet[:280].rstrip() + '…'
+        return snippet
 
 
 def public_document(row: dict[str, Any]) -> dict[str, Any]:

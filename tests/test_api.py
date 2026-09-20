@@ -9,7 +9,18 @@ from fastapi.testclient import TestClient
 
 from kms.api import create_app
 from kms.catalog import Catalog
+from kms.pdf_parse import make_pdf_bytes
 from kms.storage import LocalStore, object_key, sha256_file
+
+PAPER_TEXT = (
+    'Abstract\n'
+    'Stabilized perovskite phases for TOPCon tandem solar cells. '
+    'Tunnel oxide passivated contacts show contact resistivity of 12 mOhm after anneal.\n'
+)
+
+
+def paper_upload(name: str = 'note.pdf', text: str = PAPER_TEXT):
+    return {'file': (name, make_pdf_bytes(text), 'application/pdf')}
 
 
 class ApiAuthUploadTests(unittest.TestCase):
@@ -20,6 +31,7 @@ class ApiAuthUploadTests(unittest.TestCase):
         os.environ['KMS_CATALOG'] = str(root / 'catalog.sqlite')
         os.environ['KMS_LOCAL_ROOT'] = str(root / 'minio')
         os.environ['KMS_ADMIN_PASSWORD'] = 'admin123'
+        os.environ['KMS_AI_API_KEY'] = ''
 
         pdf = root / 'sample.pdf'
         pdf.write_bytes(b'%PDF-1.4 test preview\n')
@@ -73,7 +85,7 @@ class ApiAuthUploadTests(unittest.TestCase):
                 'authors': 'Guan',
                 'year': '2026',
             },
-            files={'file': ('note.pdf', b'%PDF-1.4 uploaded\n', 'application/pdf')},
+            files=paper_upload('note.pdf'),
         )
         self.assertEqual(upload.status_code, 200, upload.text)
         self.assertEqual(upload.json()['source'], 'upload')
@@ -92,7 +104,7 @@ class ApiAuthUploadTests(unittest.TestCase):
         untitled = self.client.post(
             '/api/papers/upload',
             data={},
-            files={'file': ('TOPCon_cell_process.pdf', b'%PDF-1.4 untitled\n', 'application/pdf')},
+            files=paper_upload('TOPCon_cell_process.pdf'),
         )
         self.assertEqual(untitled.status_code, 200, untitled.text)
         self.assertEqual(untitled.json()['title'], 'TOPCon cell process')
@@ -111,6 +123,20 @@ class ApiAuthUploadTests(unittest.TestCase):
         empty_graph = self.client.get(f'/api/papers/{doc_id}/kg')
         self.assertEqual(empty_graph.status_code, 200)
         self.assertIsNone(empty_graph.json()['run'])
+        self.assertEqual(empty_graph.json()['parse']['status'], 'none')
+
+        parsed_body = self.client.post(f'/api/papers/{doc_id}/parse')
+        self.assertEqual(parsed_body.status_code, 200, parsed_body.text)
+        self.assertEqual(parsed_body.json()['status'], 'ok')
+        self.assertGreaterEqual(parsed_body.json()['page_count'], 1)
+        self.assertIn('perovskite', parsed_body.json()['preview'].lower())
+        chunks = parsed_body.json().get('chunks') or []
+        self.assertTrue(chunks)
+        self.assertTrue(chunks[0].get('preview'))
+        self.assertNotIn('text', chunks[0])
+
+        empty_scan = self.client.post(f'/api/papers/{self.doc_id}/kg/extract')
+        self.assertEqual(empty_scan.status_code, 400)
 
         extracted = self.client.post(f'/api/papers/{doc_id}/kg/extract')
         self.assertEqual(extracted.status_code, 200, extracted.text)
@@ -122,6 +148,37 @@ class ApiAuthUploadTests(unittest.TestCase):
         self.assertIn('File', types)
         self.assertTrue(payload['neo4j']['nodes'])
         self.assertTrue(payload['neo4j']['relationships'])
+        self.assertEqual(payload['parse']['status'], 'ok')
+        self.assertTrue(payload.get('triples') is not None)
+        self.assertEqual(payload['run']['prompt_name'], 'knowledge_extract')
+        self.assertTrue(payload.get('extract', {}).get('default_prompt'))
+        self.assertIn('chunks', payload['parse'])
+        self.assertTrue(any(node.get('label_zh') or node.get('node_type_zh') for node in payload['nodes']))
+        self.assertTrue(any(edge.get('rel_type_zh') for edge in payload['edges']))
+        self.assertTrue(payload.get('triples_zh'))
+
+        from kms.catalog import Catalog as LiveCatalog
+        from kms.config import load_settings as load_live_settings
+
+        with LiveCatalog(load_live_settings().catalog_path) as live:
+            live.conn.execute("UPDATE kg_nodes SET label_zh = '', node_type_zh = ''")
+            live.conn.execute("UPDATE kg_edges SET rel_type_zh = ''")
+            live.conn.execute("UPDATE kg_runs SET zh_status = ''")
+            live.conn.commit()
+
+        wiped = self.client.get(f'/api/papers/{doc_id}/kg')
+        self.assertEqual(wiped.status_code, 200, wiped.text)
+        self.assertTrue(any(edge.get('rel_type_zh') for edge in wiped.json()['edges']))
+        self.assertTrue(any(node.get('node_type_zh') for node in wiped.json()['nodes']))
+
+        translated = self.client.post(f'/api/papers/{doc_id}/kg/translate')
+        self.assertEqual(translated.status_code, 200, translated.text)
+        self.assertEqual(translated.json()['run']['id'], payload['run']['id'])
+        self.assertTrue(any(node.get('label_zh') or node.get('node_type_zh') for node in translated.json()['nodes']))
+        self.assertTrue(any(edge.get('rel_type_zh') for edge in translated.json()['edges']))
+
+        missing = self.client.post(f'/api/papers/{self.doc_id}/kg/translate')
+        self.assertEqual(missing.status_code, 400)
 
         reviewed = self.client.post(
             f"/api/kg/runs/{payload['run']['id']}/review",
@@ -159,7 +216,7 @@ class ApiAuthUploadTests(unittest.TestCase):
         first = self.client.post(
             '/api/papers/upload',
             data={'title': 'TOPCon passivation', 'keywords': 'TOPCon, reliability'},
-            files={'file': ('a.pdf', b'%PDF-1.4 a\n', 'application/pdf')},
+            files=paper_upload('a.pdf', 'TOPCon passivation and tunnel oxide contact resistivity notes for tandem solar cells.\n'),
         )
         self.assertEqual(first.status_code, 200, first.text)
         names = [item['name'] for item in first.json()['keywords']]
@@ -170,7 +227,7 @@ class ApiAuthUploadTests(unittest.TestCase):
         second = self.client.post(
             '/api/papers/upload',
             data={'title': 'Another TOPCon note', 'keywords': 'topcon'},
-            files={'file': ('b.pdf', b'%PDF-1.4 b\n', 'application/pdf')},
+            files=paper_upload('b.pdf', 'Another TOPCon note with perovskite absorber and contact resistivity measurement.\n'),
         )
         self.assertEqual(second.status_code, 200, second.text)
         second_names = [item['name'] for item in second.json()['keywords']]
@@ -197,6 +254,14 @@ class ApiAuthUploadTests(unittest.TestCase):
         )
         self.assertEqual(prompt.status_code, 200, prompt.text)
         self.assertTrue(prompt.json()['has_custom_prompt'])
+
+        schema = self.client.patch(
+            f'/api/keywords/{topcon_id}',
+            json={'extract_schema': '{"nodes":[{"type":"Process"}]}'},
+        )
+        self.assertEqual(schema.status_code, 200, schema.text)
+        self.assertTrue(schema.json()['has_custom_schema'])
+        self.assertIn('Process', schema.json()['extract_schema'])
 
         listed = self.client.get('/api/keywords')
         self.assertGreaterEqual(len(listed.json()), 2)

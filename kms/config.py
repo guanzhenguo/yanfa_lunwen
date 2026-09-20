@@ -20,6 +20,12 @@ def _env_bool(name: str, default: bool = False) -> bool:
     return value.lower() in {'1', 'true', 'yes', 'on'}
 
 
+def _ai_api_key(ai: dict) -> str:
+    if 'KMS_AI_API_KEY' in os.environ:
+        return (os.environ.get('KMS_AI_API_KEY') or '').strip()
+    return str(ai.get('api_key') or '').strip() or _env('DEEPSEEK_API_KEY')
+
+
 def _toml_str(value: str) -> str:
     escaped = value.replace('\\', '\\\\').replace('"', '\\"')
     return f'"{escaped}"'
@@ -45,6 +51,8 @@ class Settings:
     ai_api_key: str
     ai_model: str
     ai_timeout_seconds: int
+    ai_reasoning_effort: str
+    ai_thinking: bool
     neo4j_enabled: bool
     neo4j_uri: str
     neo4j_user: str
@@ -105,10 +113,15 @@ def load_settings(
         minio_bucket=_env('KMS_MINIO_BUCKET', str(storage.get('minio_bucket') or 'papers')),
         minio_secure=_env_bool('KMS_MINIO_SECURE', bool(storage.get('minio_secure') or False)),
         catalog_path=catalog,
-        ai_base_url=_env('KMS_AI_BASE_URL', str(ai.get('base_url') or 'https://api.openai.com/v1')),
-        ai_api_key=_env('KMS_AI_API_KEY', str(ai.get('api_key') or '')),
-        ai_model=_env('KMS_AI_MODEL', str(ai.get('model') or 'gpt-4o-mini')),
-        ai_timeout_seconds=int(_env('KMS_AI_TIMEOUT', str(ai.get('timeout_seconds') or 90))),
+        ai_base_url=_env('KMS_AI_BASE_URL', str(ai.get('base_url') or 'https://api.deepseek.com')),
+        ai_api_key=_ai_api_key(ai),
+        ai_model=_env('KMS_AI_MODEL', str(ai.get('model') or 'deepseek-flash')),
+        ai_timeout_seconds=int(_env('KMS_AI_TIMEOUT', str(ai.get('timeout_seconds') or 180))),
+        ai_reasoning_effort=_env(
+            'KMS_AI_REASONING_EFFORT',
+            str(ai.get('reasoning_effort') or 'high'),
+        ),
+        ai_thinking=_env_bool('KMS_AI_THINKING', bool(ai.get('thinking', True))),
         neo4j_enabled=_env_bool('KMS_NEO4J_ENABLED', bool(neo4j.get('enabled') or False)),
         neo4j_uri=_env('KMS_NEO4J_URI', str(neo4j.get('uri') or 'bolt://127.0.0.1:7687')),
         neo4j_user=_env('KMS_NEO4J_USER', str(neo4j.get('user') or 'neo4j')),
@@ -125,6 +138,8 @@ def public_ai_settings(settings: Settings) -> dict:
         'api_key': settings.ai_api_key,
         'api_key_set': bool(settings.ai_api_key),
         'ready': settings.ai_ready,
+        'reasoning_effort': settings.ai_reasoning_effort,
+        'thinking': settings.ai_thinking,
     }
 
 
@@ -158,6 +173,8 @@ base_url = {_toml_str(settings.ai_base_url)}
 api_key = {_toml_str(settings.ai_api_key)}
 model = {_toml_str(settings.ai_model)}
 timeout_seconds = {int(settings.ai_timeout_seconds)}
+reasoning_effort = {_toml_str(settings.ai_reasoning_effort)}
+thinking = {str(settings.ai_thinking).lower()}
 
 [neo4j]
 enabled = {str(settings.neo4j_enabled).lower()}
@@ -181,12 +198,21 @@ def update_ai_settings(payload: dict) -> Settings:
     key = payload.get('api_key')
     if key is None:
         key = current.ai_api_key
+    thinking = payload.get('thinking')
+    if thinking is None:
+        thinking = current.ai_thinking
     updated = replace(
         current,
         ai_base_url=str(payload.get('base_url') or current.ai_base_url).strip(),
         ai_api_key=str(key).strip(),
         ai_model=str(payload.get('model') or current.ai_model).strip(),
         ai_timeout_seconds=int(payload.get('timeout_seconds') or current.ai_timeout_seconds),
+        ai_reasoning_effort=str(
+            payload.get('reasoning_effort')
+            if payload.get('reasoning_effort') is not None
+            else current.ai_reasoning_effort
+        ).strip(),
+        ai_thinking=bool(thinking),
     )
     save_config(updated)
     return updated

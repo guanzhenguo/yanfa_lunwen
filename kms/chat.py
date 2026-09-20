@@ -9,11 +9,14 @@ from kms.catalog import Catalog, _now
 from kms.config import Settings
 from kms.keywords import KeywordStore
 from kms.kg import PROMPT_CHAT, KnowledgeGraph
+from kms.rag import (
+    build_answer_prompt,
+    retrieve_context,
+    tokenize,
+)
 
 MAX_MESSAGE_CHARS = 32 * 1024
 HISTORY_LIMIT = 12
-RETRIEVE_LIMIT = 6
-CANDIDATE_LIMIT = 40
 
 CHAT_SCHEMA = """
 CREATE TABLE IF NOT EXISTS chat_threads (
@@ -40,24 +43,6 @@ CREATE TABLE IF NOT EXISTS chat_messages (
 CREATE INDEX IF NOT EXISTS idx_chat_messages_thread
     ON chat_messages(thread_id, id);
 """
-
-_LATIN = re.compile(r'[A-Za-z][A-Za-z0-9+\-]{1,}')
-_HAN_RUN = re.compile(r'[\u4e00-\u9fff]+')
-
-
-def tokenize(text: str) -> set[str]:
-    tokens: set[str] = set()
-    blob = text or ''
-    for word in _LATIN.findall(blob):
-        tokens.add(word.lower())
-    for run in _HAN_RUN.findall(blob):
-        if len(run) <= 2:
-            tokens.add(run)
-            continue
-        tokens.add(run)
-        for index in range(len(run) - 1):
-            tokens.add(run[index : index + 2])
-    return tokens
 
 
 def public_thread(row: dict[str, Any]) -> dict[str, Any]:
@@ -206,182 +191,6 @@ class ChatStore:
         self.conn.commit()
 
 
-def retrieve_context(
-    catalog: Catalog,
-    keys: KeywordStore,
-    kg: KnowledgeGraph,
-    question: str,
-    *,
-    limit: int = RETRIEVE_LIMIT,
-) -> list[dict[str, Any]]:
-    query = (question or '').strip()
-    if not query:
-        return []
-    query_tokens = tokenize(query)
-    rows = catalog.search(q=query, limit=CANDIDATE_LIMIT)
-    seen = {row['id'] for row in rows}
-    for extra in _keyword_hits(keys, query) + _graph_hits(kg, query):
-        if extra['id'] in seen:
-            continue
-        full = catalog.get_by_id(extra['id'])
-        if full:
-            rows.append(full)
-            seen.add(full['id'])
-    ranked: list[tuple[float, dict[str, Any], list[dict[str, Any]], list[str]]] = []
-    for row in rows:
-        keywords = keys.keywords_for(row['id'])
-        graph_labels = _graph_labels(kg, row['id'])
-        score = _score_document(query, query_tokens, row, keywords, graph_labels)
-        if score <= 0:
-            continue
-        ranked.append((score, row, keywords, graph_labels))
-    ranked.sort(key=lambda item: (-item[0], -(item[1].get('year') or 0), -item[1]['id']))
-    sources = []
-    for index, (score, row, keywords, graph_labels) in enumerate(ranked[:limit], start=1):
-        snippet = (row.get('description') or '').strip()
-        if len(snippet) > 280:
-            snippet = snippet[:280].rstrip() + '…'
-        if not snippet:
-            snippet = '；'.join(item.get('name') or '' for item in keywords[:8]) or (row.get('title') or '')
-        sources.append({
-            'index': index,
-            'paper_id': row['id'],
-            'title': row.get('title') or '',
-            'authors': row.get('authors') or '',
-            'year': row.get('year'),
-            'doi': row.get('doi') or '',
-            'has_pdf': bool(row.get('storage_key')),
-            'keywords': [item.get('name') or '' for item in keywords if item.get('name')],
-            'graph': graph_labels[:8],
-            'snippet': snippet,
-            'score': round(score, 3),
-        })
-    return sources
-
-
-def _keyword_hits(keys: KeywordStore, query: str) -> list[dict[str, Any]]:
-    tokens = [item for item in tokenize(query) if len(item) >= 2]
-    if not tokens:
-        return []
-    hits: list[dict[str, Any]] = []
-    seen: set[int] = set()
-    for token in tokens[:12]:
-        like = f'%{token}%'
-        rows = keys.conn.execute(
-            """
-            SELECT DISTINCT dk.document_id AS id
-            FROM document_keywords dk
-            JOIN keywords k ON k.id = dk.keyword_id
-            WHERE k.name LIKE ? OR k.slug LIKE ?
-            LIMIT 20
-            """,
-            (like, like),
-        ).fetchall()
-        for row in rows:
-            doc_id = int(row['id'])
-            if doc_id in seen:
-                continue
-            seen.add(doc_id)
-            hits.append({'id': doc_id})
-    return hits
-
-
-def _graph_hits(kg: KnowledgeGraph, query: str) -> list[dict[str, Any]]:
-    tokens = [item for item in tokenize(query) if len(item) >= 2]
-    if not tokens:
-        return []
-    hits: list[dict[str, Any]] = []
-    seen: set[int] = set()
-    for token in tokens[:8]:
-        like = f'%{token}%'
-        rows = kg.conn.execute(
-            """
-            SELECT DISTINCT document_id AS id
-            FROM kg_nodes
-            WHERE label LIKE ? OR properties_json LIKE ?
-            LIMIT 20
-            """,
-            (like, like),
-        ).fetchall()
-        for row in rows:
-            doc_id = int(row['id'])
-            if doc_id in seen:
-                continue
-            seen.add(doc_id)
-            hits.append({'id': doc_id})
-    return hits
-
-
-def _graph_labels(kg: KnowledgeGraph, document_id: int) -> list[str]:
-    latest = kg.latest_run(document_id)
-    if not latest or latest.get('status') not in {'pending_review', 'approved'}:
-        return []
-    rows = kg.conn.execute(
-        """
-        SELECT label, node_type FROM kg_nodes
-        WHERE run_id = ? AND node_type NOT IN ('Paper', 'File')
-        ORDER BY id
-        """,
-        (latest['id'],),
-    ).fetchall()
-    labels: list[str] = []
-    seen: set[str] = set()
-    for row in rows:
-        label = (row['label'] or '').strip()
-        if not label or label.lower() in seen:
-            continue
-        seen.add(label.lower())
-        labels.append(label)
-    return labels
-
-
-def _score_document(
-    query: str,
-    query_tokens: set[str],
-    row: dict[str, Any],
-    keywords: list[dict[str, Any]],
-    graph_labels: list[str],
-) -> float:
-    title = row.get('title') or ''
-    abstract = row.get('description') or ''
-    authors = row.get('authors') or ''
-    keyword_text = ' '.join(item.get('name') or '' for item in keywords)
-    graph_text = ' '.join(graph_labels)
-    score = 0.0
-    lowered = query.lower()
-    if lowered and lowered in title.lower():
-        score += 8
-    if lowered and lowered in keyword_text.lower():
-        score += 5
-    score += 5 * len(query_tokens & tokenize(title))
-    score += 4 * len(query_tokens & tokenize(keyword_text))
-    score += 3 * len(query_tokens & tokenize(graph_text))
-    score += 2 * len(query_tokens & tokenize(abstract))
-    score += len(query_tokens & tokenize(authors))
-    if row.get('year'):
-        score += 0.1
-    return score
-
-
-def format_source_context(sources: list[dict[str, Any]]) -> str:
-    if not sources:
-        return '（文献库未检索到相关论文）'
-    blocks = []
-    for item in sources:
-        year = item.get('year') or '年份未知'
-        keywords = '、'.join(item.get('keywords') or []) or '无'
-        graph = '、'.join(item.get('graph') or []) or '无'
-        blocks.append(
-            f"[{item['index']}] {item.get('title') or '未命名文献'} "
-            f"({year}; DOI {item.get('doi') or '无'})\n"
-            f"作者：{item.get('authors') or '未知'}\n"
-            f"关键词：{keywords}\n"
-            f"图谱：{graph}\n"
-            f"摘要：{item.get('snippet') or '无'}"
-        )
-    return '\n\n'.join(blocks)
-
-
 def heuristic_answer(question: str, sources: list[dict[str, Any]]) -> str:
     if not sources:
         return (
@@ -461,11 +270,7 @@ def run_turn(
             *_history_messages(history),
             {
                 'role': 'user',
-                'content': (
-                    '请根据下列检索文献回答问题。引用使用 [n]。\n\n'
-                    f'## 检索到的文献\n{format_source_context(sources)}\n\n'
-                    f'## 问题\n{question}'
-                ),
+                'content': build_answer_prompt(question, sources),
             },
         ]
         try:

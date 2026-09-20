@@ -41,7 +41,16 @@ from kms.chat import (
     run_turn,
 )
 from kms.keywords import KeywordStore, parse_keyword_names, public_keyword
-from kms.kg import KnowledgeGraph, extract_document_graph, parse_metadata_fields
+from kms.kg import (
+    DEFAULT_EXTRACT_SCHEMA,
+    PROMPT_EXTRACT,
+    KnowledgeGraph,
+    backfill_graph_zh,
+    extract_document_graph,
+    parse_metadata_fields,
+    translate_existing_graph,
+)
+from kms.pdf_parse import ParseError, ensure_document_parse
 from kms.storage import create_store, object_key, sha256_file
 
 WEB_DIST = PROJECT_ROOT / 'frontend' / 'dist'
@@ -112,6 +121,31 @@ def _paper_list(rows: list[dict], keys: KeywordStore) -> list[dict]:
         ]
         out.append(item)
     return out
+
+
+def _empty_parse(row: dict) -> dict:
+    return {
+        'document_id': row.get('id'),
+        'status': 'none',
+        'parser': '',
+        'sha256': '',
+        'page_count': 0,
+        'char_count': 0,
+        'chunk_count': 0,
+        'preview': '',
+        'error': '',
+        'parsed_at': '',
+        'has_pdf': bool(row.get('storage_key')),
+        'chunks': [],
+    }
+
+
+def _extract_config(kg: KnowledgeGraph, keys: KeywordStore, doc_id: int) -> dict:
+    return {
+        'default_prompt': kg.get_prompt(PROMPT_EXTRACT),
+        'default_schema': DEFAULT_EXTRACT_SCHEMA,
+        'keywords': [public_keyword(item) for item in keys.keywords_for(doc_id)],
+    }
 
 
 def create_app() -> FastAPI:
@@ -206,10 +240,13 @@ def create_app() -> FastAPI:
                 payload.get('name') or '',
                 updated_by=user['username'],
             )
-            if payload.get('extract_prompt') and user['role'] == 'admin':
+            if user['role'] == 'admin' and (
+                payload.get('extract_prompt') or payload.get('extract_schema')
+            ):
                 created = keys.update_keyword(
                     created['id'],
                     extract_prompt=str(payload.get('extract_prompt') or ''),
+                    extract_schema=str(payload.get('extract_schema') or ''),
                     updated_by=user['username'],
                 )
         except ValueError as exc:
@@ -222,10 +259,13 @@ def create_app() -> FastAPI:
         kwargs = {'updated_by': user['username']}
         if 'name' in payload:
             kwargs['name'] = payload.get('name') or ''
-        if 'extract_prompt' in payload:
+        if 'extract_prompt' in payload or 'extract_schema' in payload:
             if user['role'] != 'admin':
                 raise HTTPException(status_code=403, detail='admin only')
-            kwargs['extract_prompt'] = payload.get('extract_prompt') or ''
+            if 'extract_prompt' in payload:
+                kwargs['extract_prompt'] = payload.get('extract_prompt') or ''
+            if 'extract_schema' in payload:
+                kwargs['extract_schema'] = payload.get('extract_schema') or ''
         try:
             updated = keys.update_keyword(keyword_id, **kwargs)
         except ValueError as exc:
@@ -445,14 +485,62 @@ def create_app() -> FastAPI:
 
     @app.get('/api/papers/{doc_id}/kg')
     def get_paper_graph(doc_id: int, ctx=Depends(_authed)):
-        cat, _acc, kg, _keys, _user = ctx
+        cat, _acc, kg, keys, _user = ctx
         row = cat.get_by_id(doc_id)
         if not row:
             raise HTTPException(status_code=404, detail='not found')
         latest = kg.latest_run(doc_id)
+        extract = _extract_config(kg, keys, doc_id)
         if not latest:
-            return {'run': None, 'nodes': [], 'edges': [], 'neo4j': {'nodes': [], 'relationships': []}}
-        return kg.graph_payload(latest['id'])
+            parse = cat.parse_payload(doc_id, include_text=False) or _empty_parse(row)
+            parse['has_pdf'] = bool(row.get('storage_key'))
+            return {
+                'run': None,
+                'nodes': [],
+                'edges': [],
+                'triples': [],
+                'neo4j': {'nodes': [], 'relationships': []},
+                'parse': parse,
+                'extract': extract,
+            }
+        backfill_graph_zh(kg, latest['id'])
+        payload = kg.graph_payload(latest['id'])
+        parse = cat.parse_payload(doc_id, include_text=False) or _empty_parse(row)
+        parse['has_pdf'] = bool(row.get('storage_key'))
+        payload['parse'] = parse
+        payload['extract'] = extract
+        return payload
+
+    @app.get('/api/papers/{doc_id}/parse')
+    def get_paper_parse(doc_id: int, ctx=Depends(_authed)):
+        cat, _acc, _kg, _keys, _user = ctx
+        row = cat.get_by_id(doc_id)
+        if not row:
+            raise HTTPException(status_code=404, detail='not found')
+        payload = cat.parse_payload(doc_id, include_text=False)
+        if not payload:
+            return _empty_parse(row)
+        payload['has_pdf'] = bool(row.get('storage_key'))
+        return payload
+
+    @app.post('/api/papers/{doc_id}/parse')
+    def parse_paper(doc_id: int, force: bool = Query(default=False), ctx=Depends(_authed)):
+        cat, _acc, _kg, _keys, _user = ctx
+        row = cat.get_by_id(doc_id)
+        if not row:
+            raise HTTPException(status_code=404, detail='not found')
+        try:
+            payload = ensure_document_parse(
+                cat,
+                create_store(load_settings()),
+                row,
+                force=bool(force),
+            )
+        except ParseError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        public = cat.parse_payload(doc_id, include_text=False) or payload
+        public['has_pdf'] = True
+        return public
 
     @app.post('/api/papers/{doc_id}/kg/extract')
     def extract_paper_graph(doc_id: int, ctx=Depends(_authed)):
@@ -460,8 +548,41 @@ def create_app() -> FastAPI:
         row = cat.get_by_id(doc_id)
         if not row:
             raise HTTPException(status_code=404, detail='not found')
+        try:
+            parsed = ensure_document_parse(cat, create_store(load_settings()), row)
+        except ParseError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        if parsed.get('status') != 'ok':
+            raise HTTPException(
+                status_code=400,
+                detail=parsed.get('error') or '正文为空，无法抽取图谱',
+            )
         row['keywords'] = keys.keywords_for(doc_id)
-        return extract_document_graph(kg, row, load_settings(), user['username'])
+        payload = extract_document_graph(
+            kg,
+            row,
+            load_settings(),
+            user['username'],
+            chunks=parsed.get('chunks') or [],
+        )
+        payload['parse'] = cat.parse_payload(doc_id, include_text=False) or parsed
+        payload['extract'] = _extract_config(kg, keys, doc_id)
+        return payload
+
+    @app.post('/api/papers/{doc_id}/kg/translate')
+    def translate_paper_graph(doc_id: int, ctx=Depends(_authed)):
+        cat, _acc, kg, keys, _user = ctx
+        row = cat.get_by_id(doc_id)
+        if not row:
+            raise HTTPException(status_code=404, detail='not found')
+        try:
+            payload = translate_existing_graph(kg, load_settings(), doc_id, ai=True)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        payload['parse'] = cat.parse_payload(doc_id, include_text=False) or _empty_parse(row)
+        payload['parse']['has_pdf'] = bool(row.get('storage_key'))
+        payload['extract'] = _extract_config(kg, keys, doc_id)
+        return payload
 
     @app.post('/api/kg/runs/{run_id}/review')
     def review_graph(run_id: int, payload: dict, ctx=Depends(_authed)):

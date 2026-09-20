@@ -17,7 +17,7 @@ st.set_page_config(
 )
 
 st.title("文献问答")
-st.caption("先检索入库论文，再基于题名、摘要、关键词和图谱回答。交互方式对齐 Yuxi 的多轮对话。")
+st.caption("先对入库论文做分块混合检索（RAG），再基于题名、正文摘录、关键词和图谱回答。")
 
 settings = load_settings()
 if "qa_messages" not in st.session_state:

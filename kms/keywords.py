@@ -11,6 +11,7 @@ CREATE TABLE IF NOT EXISTS keywords (
     name TEXT NOT NULL,
     slug TEXT NOT NULL UNIQUE,
     extract_prompt TEXT NOT NULL DEFAULT '',
+    extract_schema TEXT NOT NULL DEFAULT '',
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     updated_by TEXT NOT NULL DEFAULT ''
@@ -62,17 +63,20 @@ def parse_keyword_names(value: Any) -> list[str]:
 
 def public_keyword(row: dict[str, Any], *, include_prompt: bool = True) -> dict[str, Any]:
     prompt = row.get('extract_prompt') or ''
+    schema = row.get('extract_schema') or ''
     payload = {
         'id': row['id'],
         'name': row.get('name') or '',
         'slug': row.get('slug') or '',
         'paper_count': int(row.get('paper_count') or 0),
         'has_custom_prompt': bool(prompt.strip()),
+        'has_custom_schema': bool(schema.strip()),
         'updated_at': row.get('updated_at') or '',
         'updated_by': row.get('updated_by') or '',
     }
     if include_prompt:
         payload['extract_prompt'] = prompt
+        payload['extract_schema'] = schema
     return payload
 
 
@@ -80,7 +84,15 @@ class KeywordStore:
     def __init__(self, catalog) -> None:
         self.conn = catalog.conn
         self.conn.executescript(KEYWORD_SCHEMA)
+        self._migrate()
         self.conn.commit()
+
+    def _migrate(self) -> None:
+        cols = {row[1] for row in self.conn.execute('PRAGMA table_info(keywords)')}
+        if 'extract_schema' not in cols:
+            self.conn.execute(
+                "ALTER TABLE keywords ADD COLUMN extract_schema TEXT NOT NULL DEFAULT ''"
+            )
 
     def get(self, keyword_id: int) -> dict[str, Any] | None:
         row = self.conn.execute(
@@ -135,6 +147,7 @@ class KeywordStore:
         *,
         name: str | None = None,
         extract_prompt: str | None = None,
+        extract_schema: str | None = None,
         updated_by: str = '',
     ) -> dict[str, Any]:
         current = self.get(keyword_id)
@@ -153,13 +166,17 @@ class KeywordStore:
         prompt = current.get('extract_prompt') or ''
         if extract_prompt is not None:
             prompt = extract_prompt
+        schema = current.get('extract_schema') or ''
+        if extract_schema is not None:
+            schema = extract_schema
         self.conn.execute(
             """
             UPDATE keywords
-            SET name = ?, slug = ?, extract_prompt = ?, updated_at = ?, updated_by = ?
+            SET name = ?, slug = ?, extract_prompt = ?, extract_schema = ?,
+                updated_at = ?, updated_by = ?
             WHERE id = ?
             """,
-            (new_name, new_slug, prompt, _now(), updated_by, keyword_id),
+            (new_name, new_slug, prompt, schema, _now(), updated_by, keyword_id),
         )
         self.conn.commit()
         return self.get(keyword_id) or current

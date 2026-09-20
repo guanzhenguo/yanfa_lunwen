@@ -26,7 +26,37 @@ def _headers(settings: Settings) -> dict[str, str]:
 
 
 def _completions_url(settings: Settings) -> str:
-    return settings.ai_base_url.rstrip('/') + '/chat/completions'
+    base = settings.ai_base_url.rstrip('/')
+    if base.endswith('/chat/completions'):
+        return base
+    # OpenAI SDK uses https://api.deepseek.com and adds /v1 itself.
+    if base.endswith('://api.deepseek.com'):
+        return f'{base}/v1/chat/completions'
+    return f'{base}/chat/completions'
+
+
+def _chat_payload(
+    settings: Settings,
+    messages: list[dict[str, str]],
+    *,
+    temperature: float,
+    stream: bool = False,
+    json_mode: bool = False,
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        'model': settings.ai_model,
+        'temperature': temperature,
+        'messages': messages,
+        'stream': stream,
+    }
+    if json_mode:
+        payload['response_format'] = {'type': 'json_object'}
+    effort = (settings.ai_reasoning_effort or '').strip()
+    if effort:
+        payload['reasoning_effort'] = effort
+    if settings.ai_thinking:
+        payload['thinking'] = {'type': 'enabled'}
+    return payload
 
 
 def chat_text(settings: Settings, messages: list[dict[str, str]]) -> str:
@@ -36,11 +66,7 @@ def chat_text(settings: Settings, messages: list[dict[str, str]]) -> str:
         resp = requests.post(
             _completions_url(settings),
             headers=_headers(settings),
-            json={
-                'model': settings.ai_model,
-                'temperature': 0.2,
-                'messages': messages,
-            },
+            json=_chat_payload(settings, messages, temperature=0.2),
             timeout=settings.ai_timeout_seconds,
         )
     except requests.RequestException as exc:
@@ -60,12 +86,7 @@ def chat_stream(settings: Settings, messages: list[dict[str, str]]) -> Iterator[
         resp = requests.post(
             _completions_url(settings),
             headers=_headers(settings),
-            json={
-                'model': settings.ai_model,
-                'temperature': 0.2,
-                'messages': messages,
-                'stream': True,
-            },
+            json=_chat_payload(settings, messages, temperature=0.2, stream=True),
             timeout=(10, settings.ai_timeout_seconds),
             stream=True,
         )
@@ -112,20 +133,12 @@ def chat_stream(settings: Settings, messages: list[dict[str, str]]) -> Iterator[
 def chat_json(settings: Settings, messages: list[dict[str, str]]) -> dict[str, Any]:
     if not settings.ai_ready:
         raise AiNotConfigured('AI is not configured')
-    url = settings.ai_base_url.rstrip('/') + '/chat/completions'
+    url = _completions_url(settings)
     try:
         resp = requests.post(
             url,
-            headers={
-                'Authorization': f'Bearer {settings.ai_api_key}',
-                'Content-Type': 'application/json',
-            },
-            json={
-                'model': settings.ai_model,
-                'temperature': 0.1,
-                'messages': messages,
-                'response_format': {'type': 'json_object'},
-            },
+            headers=_headers(settings),
+            json=_chat_payload(settings, messages, temperature=0.1, json_mode=True),
             timeout=settings.ai_timeout_seconds,
         )
     except requests.RequestException as exc:

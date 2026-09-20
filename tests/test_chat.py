@@ -14,6 +14,7 @@ from kms.chat import ChatStore, collect_turn, retrieve_context, tokenize
 from kms.config import load_settings
 from kms.keywords import KeywordStore
 from kms.kg import KnowledgeGraph
+from kms.pdf_parse import ensure_document_parse, make_pdf_bytes
 from kms.storage import LocalStore, object_key, sha256_file
 
 
@@ -28,7 +29,10 @@ class ChatQaTests(unittest.TestCase):
         os.environ['KMS_AI_API_KEY'] = ''
 
         pdf = root / 'sample.pdf'
-        pdf.write_bytes(b'%PDF-1.4 qa\n')
+        pdf.write_bytes(make_pdf_bytes(
+            'Abstract\nStabilized perovskite phases for TOPCon tandem cells. '
+            'Unique marker contact resistivity 12 mOhm after 400 C anneal.\n'
+        ))
         store = LocalStore(root / 'minio', bucket='papers')
         digest = sha256_file(pdf)
         key = object_key(digest)
@@ -47,6 +51,7 @@ class ChatQaTests(unittest.TestCase):
             'sha256': digest,
         })
         keys.set_document_keywords(self.doc_id, ['TOPCon', 'perovskite'], source='test')
+        ensure_document_parse(catalog, store, catalog.get_by_id(self.doc_id))
         catalog.close()
         self.client = TestClient(create_app())
 
@@ -76,6 +81,46 @@ class ChatQaTests(unittest.TestCase):
         self.assertTrue(sources)
         self.assertEqual(sources[0]['paper_id'], self.doc_id)
         self.assertIn('TOPCon', sources[0]['keywords'])
+
+    def test_retrieve_hits_parsed_body(self) -> None:
+        settings = load_settings()
+        with Catalog(settings.catalog_path) as catalog:
+            sources = retrieve_context(
+                catalog,
+                KeywordStore(catalog),
+                KnowledgeGraph(catalog),
+                'contact resistivity 12 mOhm',
+            )
+        self.assertTrue(sources)
+        self.assertEqual(sources[0]['paper_id'], self.doc_id)
+        self.assertIn('12 mOhm', sources[0]['snippet'])
+        self.assertTrue(sources[0].get('chunks'))
+        self.assertTrue(any('bm25' in (src.get('fusion_sources') or []) or 'vector' in (src.get('fusion_sources') or []) for src in sources))
+
+    def test_retrieve_hits_chinese_graph_labels(self) -> None:
+        self._login()
+        extracted = self.client.post(f'/api/papers/{self.doc_id}/kg/extract')
+        self.assertEqual(extracted.status_code, 200, extracted.text)
+        nodes = extracted.json()['nodes']
+        self.assertTrue(any((node.get('label_zh') or '') == '钙钛矿' for node in nodes))
+        settings = load_settings()
+        with Catalog(settings.catalog_path) as catalog:
+            sources = retrieve_context(
+                catalog,
+                KeywordStore(catalog),
+                KnowledgeGraph(catalog),
+                '钙钛矿钝化工艺',
+            )
+        self.assertTrue(sources)
+        self.assertEqual(sources[0]['paper_id'], self.doc_id)
+        self.assertTrue(any('钙钛矿' in (item or '') for item in sources[0]['graph']))
+        self.assertTrue(any('具有关键词' in (item or '') for item in sources[0]['triples']))
+        self.assertTrue(sources[0].get('chunks'))
+        blob = ' '.join(item.get('text') or '' for item in sources[0]['chunks']).lower()
+        self.assertTrue(
+            'perovskite' in blob or 'topcon' in blob or '12 mohm' in blob,
+            blob[:240],
+        )
 
     def test_json_chat_without_model_returns_sources(self) -> None:
         self._login()
@@ -135,6 +180,8 @@ class ChatQaTests(unittest.TestCase):
         def fake_stream(_settings, messages):
             blob = messages[-1]['content']
             self.assertIn('Stabilized perovskite', blob)
+            self.assertIn('文档 1', blob)
+            self.assertIn('用户问题', blob)
             yield '根据 [1]，'
             yield 'TOPCon 与钙钛矿叠层相关。'
 

@@ -69,7 +69,7 @@ function openSource(item) {
 
 function openGraph(item) {
   if (!item?.paper_id) return
-  emit('graph', { id: item.paper_id, title: item.title })
+  emit('graph', { id: item.paper_id, title: item.title, has_pdf: item.has_pdf })
 }
 
 async function scrollBottom() {
@@ -179,7 +179,7 @@ onMounted(async () => {
           @click="loadThread(item.id)"
         >
           <span>{{ item.title }}</span>
-          <em @click.stop="removeThread(item.id)">删除</em>
+          <em class="danger-text" @click.stop="removeThread(item.id)">删除</em>
         </button>
         <p v-if="!threads.length" class="hint">还没有对话。直接提问会自动创建。</p>
       </div>
@@ -187,11 +187,12 @@ onMounted(async () => {
     <section class="chat-main">
       <div ref="listEl" class="chat-log" aria-live="polite">
         <div v-if="!messages.length" class="chat-empty">
-          向文献库提问工艺、材料、电池结构或可靠性问题。<br />
-          系统会先检索入库论文，再基于题名、摘要、关键词和图谱作答，并附来源。
+          <strong>向文献库提问</strong>
+          工艺、材料、电池结构或可靠性问题都可以问。<br />
+          系统会先对正文分块做混合检索（关键词 + 全文 + 图谱），再基于检索片段生成回答，并附来源。
         </div>
         <article v-for="(item, index) in messages" :key="item.id || index" class="bubble-row" :class="item.role">
-          <div class="avatar" aria-hidden="true" />
+          <div class="avatar" aria-hidden="true">{{ item.role === 'user' ? '我' : '答' }}</div>
           <div class="bubble">
             <pre class="content">{{ item.content || (item.role === 'assistant' && running ? '…' : '') }}</pre>
             <div v-if="item.sources?.length" class="sources">
@@ -200,18 +201,21 @@ onMounted(async () => {
                 :key="src.paper_id"
                 class="source"
                 type="button"
+                :title="src.snippet || src.title"
                 @click="openSource(src)"
               >
                 [{{ src.index }}] {{ src.title }}
                 <span v-if="src.year"> · {{ src.year }}</span>
+                <span v-if="src.page_from"> · p.{{ src.page_from }}–{{ src.page_to }}</span>
               </button>
               <button
-                v-if="item.sources[0]"
+                v-for="src in item.sources"
+                :key="'g-' + src.paper_id"
                 class="source ghost"
                 type="button"
-                @click="openGraph(item.sources[0])"
+                @click="openGraph(src)"
               >
-                查看图谱
+                图谱 {{ src.index }}
               </button>
             </div>
           </div>
@@ -227,7 +231,7 @@ onMounted(async () => {
         />
         <div class="composer-row">
           <span class="hint">{{ status }}</span>
-          <button class="primary" type="submit" :disabled="running || !draft.trim()">发送</button>
+          <button class="primary send" type="submit" :disabled="running || !draft.trim()">发送</button>
         </div>
       </form>
     </section>

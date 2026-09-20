@@ -12,10 +12,14 @@ minio_bucket = "papers"
 minio_secure = false
 
 [ai]
-base_url = "https://api.openai.com/v1"
+# DeepSeek OpenAI-compatible API. Fill api_key, or set DEEPSEEK_API_KEY.
+# This model is used for paper graph extraction (and other AI calls).
+base_url = "https://api.deepseek.com"
 api_key = ""
-model = "gpt-4o-mini"
-timeout_seconds = 90
+model = "deepseek-flash"
+timeout_seconds = 180
+reasoning_effort = "high"
+thinking = true
 
 [neo4j]
 enabled = false
